@@ -2,17 +2,31 @@ import os
 from fastapi import FastAPI, HTTPException, Depends, Header
 from pydantic import BaseModel
 from typing import List, Optional
-from .models import User, Group
-from neomodel import config
+from neo4j import GraphDatabase, Query
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
 load_dotenv()
 
-config.DATABASE_URL = os.getenv("DATABASE_URL")
+NEO4J_URI = os.getenv("DATABASE_URL")
+NEO4J_USER = os.getenv("NEO4J_USER")
+NEO4J_PASSWORD = os.getenv("NEO4J_PASSWORD")
+API_TOKEN = os.getenv("API_TOKEN")
+
+if not all([NEO4J_URI, NEO4J_USER, NEO4J_PASSWORD, API_TOKEN]):
+    raise ValueError("Убедитесь, что все переменные окружения указаны")
+
+driver = GraphDatabase.driver(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
 
 app = FastAPI()
 
-API_TOKEN = os.getenv("API_TOKEN")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 def get_token(token: str = Header(...)):
@@ -23,131 +37,176 @@ def get_token(token: str = Header(...)):
 class UserRequest(BaseModel):
     user_id: int
     name: str
-    subscriptions: Optional[List[int]] = []  # Список групп, на которые подписан пользователь
-    follows: Optional[List[int]] = []  # Список пользователей, на которых подписан пользователь
+    sex: int
+    home_town: str
+    city: str
+    subscriptions: Optional[List[int]] = []
+    follows: Optional[List[int]] = []
 
 
 class GroupRequest(BaseModel):
     group_id: int
     name: str
-    subscribers: Optional[List[int]] = []  # Список пользователей, подписанных на группу
+    subscribers: Optional[List[int]] = []
 
 
-class NodeResponse(BaseModel):
-    id: int
-    name: str
+@app.on_event("shutdown")
+async def shutdown():
+    driver.close()
 
 
-def update_relationships(user: User, subscriptions: List[int], follows: List[int]):
-    # Обновление подписок на группы
-    for group_id in subscriptions:
-        group = Group.nodes.get_or_none(group_id=group_id)
-        if group:
-            user.subscriptions.connect(group)
-        else:
-            raise HTTPException(status_code=404, detail=f"Group {group_id} not found")
-
-    # Обновление подписок на других пользователей
-    for follow_id in follows:
-        followed_user = User.nodes.get_or_none(user_id=follow_id)
-        if followed_user:
-            user.follows.connect(followed_user)
-        else:
-            raise HTTPException(status_code=404, detail=f"User {follow_id} not found")
-
-
-@app.get("/users/", response_model=List[NodeResponse])
+@app.get("/users/")
 async def get_all_users():
-    users = User.nodes.all()
-    return [{"id": user.user_id, "name": user.name} for user in users]
+    query = Query("""
+    MATCH (u:User)
+    RETURN u.user_id AS id, u.name AS name, u.sex AS sex, u.home_town AS home_town, u.city AS city
+    """)
+    with driver.session() as session:
+        result = session.run(query)
+        users = [record.data() for record in result]
+    return users
 
 
 @app.get("/users/{user_id}/relationships/")
 async def get_user_relationships(user_id: int):
-    user = User.nodes.get_or_none(user_id=user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    query = Query(
+        """
+        MATCH (u:User {user_id: $user_id})
+        OPTIONAL MATCH (u)-[:Subscribe]->(g:Group)
+        OPTIONAL MATCH (u)-[:Follow]->(followed:User)
+        OPTIONAL MATCH (follower:User)-[:Follow]->(u)
+        RETURN
+            [x IN COLLECT(DISTINCT {group_id: g.group_id, name: g.name, relationship: "Subscribe"}) WHERE x.group_id IS NOT NULL] AS subscriptions,
+            [x IN COLLECT(DISTINCT {user_id: followed.user_id, name: followed.name, relationship: "Follow"}) WHERE x.user_id IS NOT NULL] AS outgoing_follows,
+            [x IN COLLECT(DISTINCT {user_id: follower.user_id, name: follower.name, relationship: "Follow"}) WHERE x.user_id IS NOT NULL] AS incoming_follows
+        """
+    )
+    with driver.session() as session:
+        result = session.run(query, user_id=user_id)
+        record = result.single()
+        if not record:
+            raise HTTPException(status_code=404, detail="User not found")
 
-    relationships = [{"group_id": group.group_id, "name": group.name, "relationship": "Subscribe"} for group in user.subscriptions.all()]
-    relationships += [{"user_id": followed.user_id, "name": followed.name, "relationship": "Follow"} for followed in user.follows.all()]
-    return {"user_id": user.user_id, "name": user.name, "relationships": relationships}
+        combined_relationships = []
+        if record["subscriptions"]:
+            combined_relationships += record["subscriptions"]
+        if record["outgoing_follows"]:
+            combined_relationships += record["outgoing_follows"]
+        if record["incoming_follows"]:
+            combined_relationships += record["incoming_follows"]
+
+        if not combined_relationships:
+            return {"relationships": []}
+
+        return {"relationships": combined_relationships}
 
 
+# Создание пользователя
 @app.post("/users/", dependencies=[Depends(get_token)])
 async def create_user(user_request: UserRequest):
-    existing_user = User.nodes.get_or_none(user_id=user_request.user_id)
-    if existing_user:
-        raise HTTPException(status_code=400, detail="User already exists")
-
-    user = User(user_id=user_request.user_id, name=user_request.name).save()
-
-    update_relationships(user, user_request.subscriptions, user_request.follows)
-
-    return {"message": f"User {user.user_id} created with name {user.name}"}
-
-
-@app.patch("/users/{user_id}", dependencies=[Depends(get_token)])
-async def update_user(user_id: int, user_request: UserRequest):
-    user = User.nodes.get_or_none(user_id=user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    update_relationships(user, user_request.subscriptions, user_request.follows)
-
-    return {"message": f"User {user.user_id} updated with new relationships"}
+    create_user_query = Query("""
+    MERGE (u:User {user_id: $user_id})
+    SET u.name = $name, u.sex = $sex, u.home_town = $home_town, u.city = $city
+    """)
+    with driver.session() as session:
+        session.run(create_user_query, **user_request.dict())
+        for group_id in user_request.subscriptions:
+            session.run(
+                Query("""
+                MATCH (u:User {user_id: $user_id}), (g:Group {group_id: $group_id})
+                MERGE (u)-[:Subscribe]->(g)
+                """),
+                user_id=user_request.user_id,
+                group_id=group_id,
+            )
+        for follow_id in user_request.follows:
+            session.run(
+                Query("""
+                MATCH (u:User {user_id: $user_id}), (f:User {user_id: $follow_id})
+                MERGE (u)-[:Follow]->(f)
+                """),
+                user_id=user_request.user_id,
+                follow_id=follow_id,
+            )
+    return {"message": f"User {user_request.user_id} created"}
 
 
 @app.delete("/users/{user_id}", dependencies=[Depends(get_token)])
 async def delete_user(user_id: int):
-    user = User.nodes.get_or_none(user_id=user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
+    query = Query("""
+    MATCH (u:User {user_id: $user_id})
+    DETACH DELETE u
+    """)
+    with driver.session() as session:
+        session.run(query, user_id=user_id)
+    return {"message": f"User {user_id} deleted"}
 
-    user.delete()
-    return {"message": f"User {user_id} and all its relationships deleted"}
 
-
-# Маршруты для работы с группами
-
-@app.get("/groups/", response_model=List[NodeResponse])
+@app.get("/groups/")
 async def get_all_groups():
-    groups = Group.nodes.all()
-    return [{"id": group.group_id, "name": group.name} for group in groups]
+    query = Query("""
+    MATCH (g:Group)
+    RETURN g.group_id AS id, g.name AS name, g.subscribers_count AS subscribers_count
+    """)
+    with driver.session() as session:
+        result = session.run(query)
+        groups = [
+            {
+                "id": record["id"],
+                "name": record["name"],
+                "subscribers_count": record["subscribers_count"]
+            }
+            for record in result
+        ]
+    return groups
 
 
 @app.get("/groups/{group_id}/relationships/")
 async def get_group_relationships(group_id: int):
-    group = Group.nodes.get_or_none(group_id=group_id)
-    if not group:
-        raise HTTPException(status_code=404, detail="Group not found")
+    query = Query("""
+    MATCH (g:Group {group_id: $group_id})
+    OPTIONAL MATCH (u:User)-[:Subscribe]->(g)
+    RETURN COLLECT(DISTINCT {user_id: u.user_id, name: u.name}) AS subscribers
+    """)
+    with driver.session() as session:
+        result = session.run(query, group_id=group_id)
+        record = result.single()
+        if not record:
+            raise HTTPException(status_code=404, detail="Group not found")
 
-    relationships = [{"user_id": user.user_id, "name": user.name, "relationship": "Subscribe"} for user in group.subscribed_by.all()]
-    return {"group_id": group.group_id, "name": group.name, "relationships": relationships}
+        subscribers = [
+            subscriber for subscriber in record["subscribers"]
+            if subscriber["user_id"] is not None and subscriber["name"] is not None
+        ]
+        return {"group_id": group_id, "relationships": subscribers}
 
 
 @app.post("/groups/", dependencies=[Depends(get_token)])
 async def create_group(group_request: GroupRequest):
-    existing_group = Group.nodes.get_or_none(group_id=group_request.group_id)
-    if existing_group:
-        raise HTTPException(status_code=400, detail="Group already exists")
-
-    group = Group(group_id=group_request.group_id, name=group_request.name).save()
-
-    for user_id in group_request.subscribers:
-        user = User.nodes.get_or_none(user_id=user_id)
-        if user:
-            user.subscriptions.connect(group)
-        else:
-            raise HTTPException(status_code=404, detail=f"User {user_id} not found")
-
-    return {"message": f"Group {group.group_id} created with name {group.name}"}
+    create_group_query = Query("""
+    MERGE (g:Group {group_id: $group_id})
+    SET g.name = $name
+    """)
+    with driver.session() as session:
+        session.run(create_group_query, **group_request.dict())
+        for user_id in group_request.subscribers:
+            session.run(
+                Query("""
+                MATCH (u:User {user_id: $user_id}), (g:Group {group_id: $group_id})
+                MERGE (u)-[:Subscribe]->(g)
+                """),
+                user_id=user_id,
+                group_id=group_request.group_id,
+            )
+    return {"message": f"Group {group_request.group_id} created"}
 
 
 @app.delete("/groups/{group_id}", dependencies=[Depends(get_token)])
 async def delete_group(group_id: int):
-    group = Group.nodes.get_or_none(group_id=group_id)
-    if not group:
-        raise HTTPException(status_code=404, detail="Group not found")
-
-    group.delete()
-    return {"message": f"Group {group_id} and all its relationships deleted"}
+    query = Query("""
+    MATCH (g:Group {group_id: $group_id})
+    DETACH DELETE g
+    """)
+    with driver.session() as session:
+        session.run(query, group_id=group_id)
+    return {"message": f"Group {group_id} deleted"}
